@@ -23,6 +23,7 @@ import os
 import numpy as np
 import paddle
 import paddle.nn as nn
+import paddle.nn.functional as F
 
 from passl.utils import logger
 from passl.models.base_model import Model
@@ -42,6 +43,7 @@ __all__ = [
     'ViT_g_patch14_224',
     'ViT_G_patch14_224',
     'ViT_6B_patch14_224',
+    'ViT_22B_patch14_224',
     'VisionTransformer',
 ]
 
@@ -206,6 +208,120 @@ class Block(nn.Layer):
         return x
 
 
+
+class ParallelScalingBlock(nn.Layer):
+    """ Parallel ViT block (MLP & Attention in parallel)
+    Based on:
+      'Scaling Vision Transformers to 22 Billion Parameters` - https://arxiv.org/abs/2302.05442
+    """
+
+    def __init__(self,
+                 dim,
+                 num_heads,
+                 mlp_ratio=4.,
+                 qkv_bias=False,
+                 qk_scale=None, 
+                 attn_drop=0.,
+                 drop=0.,
+                 drop_path=0.,
+                 act_layer=nn.GELU,
+                 norm_layer=nn.LayerNorm,
+                 epsilon=1e-5):
+        super().__init__()
+        assert dim % num_heads == 0, 'dim should be divisible by num_heads'
+        if isinstance(norm_layer, str):
+            self.norm1 = eval(norm_layer)(dim, epsilon=epsilon)
+        elif isinstance(norm_layer, Callable):
+            self.norm1 = norm_layer(dim)
+        else:
+            raise TypeError(
+                "The norm_layer must be str or paddle.nn.layer.Layer class")
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        #self.fused_attn = use_fused_attn()
+        self.fused_attn = False
+        mlp_hidden_dim = int(mlp_ratio * dim)
+        in_proj_out_dim = mlp_hidden_dim + 3 * dim
+
+        self.in_norm = norm_layer(dim)
+        self.in_proj = nn.Linear(dim, in_proj_out_dim, bias_attr=qkv_bias)
+        self.in_split = [mlp_hidden_dim] + [dim] * 3
+        if qkv_bias:
+            self.register_buffer('qkv_bias', None)
+            self.register_parameter('mlp_bias', None)
+        else:
+            self.register_buffer('qkv_bias', paddle.zeros([3 * dim]), persistable=False)
+            #self.mlp_bias = nn.Parameter(paddle.zeros([mlp_hidden_dim]))
+            mlp_bias = self.create_parameter([mlp_hidden_dim], is_bias=True)
+            self.add_parameter("mlp_bias", mlp_bias)
+        
+        qk_norm=True
+        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.attn_out_proj = nn.Linear(dim, dim)
+
+        self.mlp_drop = nn.Dropout(drop)
+        self.mlp_act = act_layer()
+        self.mlp_out_proj = nn.Linear(mlp_hidden_dim, dim)
+
+        #self.ls = LayerScale(dim, init_values=init_values) if init_values is not None else nn.Identity()
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                init.zeros_(m.bias)
+
+    def forward(self, x):
+        B, N, C = x.shape
+
+        # Combined MLP fc1 & qkv projections
+        y = self.in_norm(x)
+        if self.mlp_bias is not None:
+            # Concat constant zero-bias for qkv w/ trainable mlp_bias.
+            # Appears faster than adding to x_mlp separately
+            y = F.linear(y, self.in_proj.weight, paddle.concat((self.qkv_bias, self.mlp_bias)))
+        else:
+            y = self.in_proj(y)
+
+        #self.in_split = y.shape[-1] / self.in_split
+        x_mlp, q, k, v = paddle.split(y, self.in_split, axis=-1)
+
+        # Dot product attention w/ qk norm
+        q = self.q_norm(q.reshape((B, N, self.num_heads, self.head_dim))).transpose((0, 2, 1, 3))
+        k = self.k_norm(k.reshape((B, N, self.num_heads, self.head_dim))).transpose((0, 2, 1, 3))
+        v = v.reshape((B, N, self.num_heads, self.head_dim)).transpose((0, 2, 1, 3))
+        if self.fused_attn:
+            x_attn = F.scaled_dot_product_attention(
+                q, k, v,
+                dropout_p=self.attn_drop.p,
+            )
+        else:
+            attn = (q.matmul(k.transpose((0, 1, 3, 2)))) * self.scale
+            attn = nn.functional.softmax(attn, axis=-1)
+            attn = self.attn_drop(attn)
+            x_attn = attn.matmul(v)
+           
+        x_attn = x_attn.transpose((0, 2, 1, 3)).reshape((-1, N, C))
+        x_attn = self.attn_out_proj(x_attn)
+
+        # MLP activation, dropout, fc2
+        x_mlp = self.mlp_act(x_mlp)
+        x_mlp = self.mlp_drop(x_mlp)
+        x_mlp = self.mlp_out_proj(x_mlp)
+
+        # Add residual w/ drop path & layer scale applied
+        #y = self.drop_path(self.ls(x_attn + x_mlp))
+        y = self.drop_path(x_attn + x_mlp)
+        x = x + y
+        return x
+
+ 
 class PatchEmbed(nn.Layer):
     """ Image to Patch Embedding
     """
@@ -267,9 +383,10 @@ class VisionTransformer(Model):
                  drop_rate=0.,
                  attn_drop_rate=0.,
                  drop_path_rate=0.,
-                 norm_layer='nn.LayerNorm',
+                 norm_layer=nn.LayerNorm,
                  epsilon=1e-5,
                  representation_size=None,
+                 block_fn=Block,
                  **kwargs):
         super().__init__()
         self.class_num = class_num
@@ -295,7 +412,7 @@ class VisionTransformer(Model):
         dpr = np.linspace(0, drop_path_rate, depth)
 
         self.blocks = nn.LayerList([
-            Block(
+            block_fn(
                 dim=embed_dim,
                 num_heads=num_heads,
                 mlp_ratio=mlp_ratio,
@@ -611,5 +728,22 @@ def ViT_6B_patch14_224(**kwargs):
         qkv_bias=True,
         epsilon=1e-6,
         representation_size=2320,
+        **kwargs)
+    return model
+
+
+def ViT_22B_patch14_224(**kwargs):
+    model = VisionTransformer(
+        img_size=224,
+        patch_size=14,
+        embed_dim=6144,
+        #depth=48, # original depth is 48
+        depth=4,
+        num_heads=48,
+        mlp_ratio=4,
+        qkv_bias=False,
+        epsilon=1e-6,
+        representation_size=6144,
+        block_fn=ParallelScalingBlock,
         **kwargs)
     return model
